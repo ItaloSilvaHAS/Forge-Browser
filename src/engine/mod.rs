@@ -1,7 +1,7 @@
 use scraper::{Html, Selector};
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use reqwest::blocking::Client;
 use std::time::Duration;
+use url::Url;
 
 #[derive(Clone, Debug)]
 pub enum ElementoWeb {
@@ -10,68 +10,37 @@ pub enum ElementoWeb {
     Link(String, String), // Texto, URL
 }
 
-pub fn baixar_html_bruto(host: &str) -> String {
-    let clean_host = host.trim_start_matches("http://").trim_start_matches("https://");
-    let (host_only, path) = match clean_host.find('/') {
-        Some(pos) => (&clean_host[..pos], &clean_host[pos..]),
-        None => (clean_host, "/"),
-    };
-    
-    let addr = format!("{}:80", host_only);
-    let socket_addr = match addr.parse::<std::net::SocketAddr>() {
-        Ok(s) => Some(s),
-        Err(_) => {
-            use std::net::ToSocketAddrs;
-            match addr.to_socket_addrs() {
-                Ok(mut iter) => iter.next(),
-                Err(_) => None,
+pub fn baixar_html_bruto(url: &str) -> String {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    match client.get(url).send() {
+        Ok(res) => {
+            if res.status().is_success() {
+                res.text().unwrap_or_else(|_| "Erro ao ler o corpo da página.".to_string())
+            } else {
+                format!("Erro HTTP {}: {}", res.status(), url)
             }
         }
-    };
-
-    let socket_addr = match socket_addr {
-        Some(a) => a,
-        None => return format!("Erro: Não foi possível resolver o host '{}'.", host_only),
-    };
-
-    match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5)) {
-        Ok(mut stream) => {
-            let request = format!(
-                "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: ForgeBrowser/1.0\r\nAccept: text/html\r\nConnection: close\r\n\r\n",
-                path, host_only
-            );
-            if let Err(e) = stream.write_all(request.as_bytes()) {
-                return format!("Erro ao enviar requisição: {}", e);
-            }
-            
-            let mut buffer = Vec::new();
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(7)));
-            
-            match stream.read_to_end(&mut buffer) {
-                Ok(_) => {
-                    let response = String::from_utf8_lossy(&buffer);
-                    if response.contains("HTTP/1.1 301") || response.contains("HTTP/1.1 302") {
-                        if let Some(loc_idx) = response.find("Location: ") {
-                            let rest = &response[loc_idx + 10..];
-                            if let Some(end_idx) = rest.find("\r\n") {
-                                let new_loc = &rest[..end_idx];
-                                return format!("REDIRECT:{}", new_loc);
-                            }
-                        }
-                        return "Este site redirecionou para HTTPS. Suporte apenas HTTP/80.".to_string();
-                    }
-                    response.to_string()
-                },
-                Err(e) => format!("Erro ao ler resposta: {}", e),
-            }
-        }
-        Err(e) => format!("Erro de Conexão com {}: {}.", host_only, e),
+        Err(e) => format!("Erro de conexão: {}. Verifique se a URL está correta.", e),
     }
 }
 
-pub fn processar_html_semantico(html: &str) -> Vec<ElementoWeb> {
+pub fn processar_html_semantico(html: &str, base_url: &str) -> Vec<ElementoWeb> {
     let document = Html::parse_document(html);
     let mut elementos = Vec::new();
+
+    // Tentar extrair o título da página
+    let selector_title = Selector::parse("title").unwrap();
+    if let Some(title_node) = document.select(&selector_title).next() {
+        let title_text = title_node.text().collect::<Vec<_>>().join("");
+        if !title_text.trim().is_empty() {
+            elementos.push(ElementoWeb::Titulo(title_text));
+        }
+    }
 
     let seletor_h = Selector::parse("h1, h2, h3").unwrap();
     let seletor_p = Selector::parse("p").unwrap();
@@ -87,8 +56,21 @@ pub fn processar_html_semantico(html: &str) -> Vec<ElementoWeb> {
     for a in document.select(&seletor_a) {
         let texto = a.text().collect::<Vec<_>>().join(" ");
         let href = a.value().attr("href").unwrap_or("").to_string();
+        
         if !texto.trim().is_empty() && !href.is_empty() {
-            elementos.push(ElementoWeb::Link(texto, href));
+            // Resolver URLs relativas
+            let absolute_url = if href.starts_with("http") {
+                href
+            } else if href.starts_with('/') {
+                if let Ok(base) = Url::parse(base_url) {
+                    format!("{}://{}{}", base.scheme(), base.host_str().unwrap_or(""), href)
+                } else {
+                    href
+                }
+            } else {
+                href
+            };
+            elementos.push(ElementoWeb::Link(texto, absolute_url));
         }
     }
 
@@ -109,19 +91,16 @@ pub fn processar_html_semantico(html: &str) -> Vec<ElementoWeb> {
 pub fn resolve_smart_query(input: &str) -> String {
     let input = input.trim();
     
-    // Se começar com http:// ou https://, já é uma URL completa
     if input.starts_with("http://") || input.starts_with("https://") {
         return input.to_string();
     }
 
-    // Verifica se parece um domínio (ex: google.com, localhost:8000, 192.168.1.1)
-    let is_domain = input.contains('.') && !input.contains(' ') || input.starts_with("localhost");
+    let is_domain = (input.contains('.') && !input.contains(' ')) || input.starts_with("localhost");
     
     if is_domain {
-        format!("http://{}", input)
+        format!("https://{}", input)
     } else {
-        // Busca refinada via DuckDuckGo (Lite version para facilitar o parsing se necessário)
-        // Usamos a versão que retorna HTML simples
-        format!("http://duckduckgo.com/html/?q={}", input.replace(' ', "+"))
+        // Busca via DuckDuckGo (usando a versão HTML sem JS)
+        format!("https://duckduckgo.com/html/?q={}", input.replace(' ', "+"))
     }
 }
