@@ -108,11 +108,20 @@ pub fn processar_html_semantico(html: &str) -> Vec<ElementoWeb> {
 
 pub fn resolve_smart_query(input: &str) -> String {
     let input = input.trim();
-    if (input.contains('.') && !input.contains(' ')) || input.starts_with("localhost") {
-        input.to_string()
+    
+    // Se começar com http:// ou https://, já é uma URL completa
+    if input.starts_with("http://") || input.starts_with("https://") {
+        return input.to_string();
+    }
+
+    // Verifica se parece um domínio (ex: google.com, localhost:8000, 192.168.1.1)
+    let is_domain = input.contains('.') && !input.contains(' ') || input.starts_with("localhost");
+    
+    if is_domain {
+        format!("http://{}", input)
     } else {
-        // Integração simples com DuckDuckGo (via HTTP 80 para manter compatibilidade)
-        // Como o motor é minimalista, apenas simulamos a query ou apontamos para um host de busca
-        format!("duckduckgo.com/?q={}", input.replace(' ', "+"))
+        // Busca refinada via DuckDuckGo (Lite version para facilitar o parsing se necessário)
+        // Usamos a versão que retorna HTML simples
+        format!("http://duckduckgo.com/html/?q={}", input.replace(' ', "+"))
     }
 }
