@@ -1,0 +1,8 @@
+[package]
+name = "WebEngine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.24.0" 
+scraper = "0.18.1"
