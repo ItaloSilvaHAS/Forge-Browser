@@ -89,25 +89,29 @@ impl eframe::App for ForgeApp {
                     ui.add_space(20.0);
 
                     // Container da Barra de Endereço Arredondada
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("Search or type URL...")
-                            .desired_width(ui.available_width() - 150.0)
-                            .margin(egui::vec2(15.0, 10.0))
-                            .frame(false)
-                    );
+                    let (rect, response) = ui.allocate_at_least(egui::vec2(ui.available_width() - 150.0, 40.0), egui::Sense::click());
                     
-                    // Desenha fundo da barra de busca manualmente para garantir contraste e foco
-                    let rect = response.rect;
-                    let visual_bg = if response.has_focus() {
+                    let visual_bg = if response.has_focus() || ui.memory(|m| m.has_focus(egui::Id::new("search_bar"))) {
                         egui::Color32::from_rgb(50, 50, 50)
                     } else {
                         egui::Color32::from_rgb(40, 40, 40)
                     };
                     ui.painter().rect_filled(rect, 20.0, visual_bg);
+
+                    let text_edit_response = ui.put(
+                        rect.shrink2(egui::vec2(15.0, 5.0)),
+                        egui::TextEdit::singleline(&mut self.query)
+                            .id(egui::Id::new("search_bar"))
+                            .hint_text("Search or type URL...")
+                            .frame(false)
+                    );
                     
-                    // Se perdeu o foco ou apertou Enter, navega
-                    if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || ui.button("EXPLORE").clicked() {
+                    if response.clicked() {
+                        text_edit_response.request_focus();
+                    }
+                    
+                    // Se apertou Enter ou clicou no botão, navega
+                    if (text_edit_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || ui.button("EXPLORE").clicked() {
                         self.navegar(self.query.clone(), ctx);
                     }
                     
