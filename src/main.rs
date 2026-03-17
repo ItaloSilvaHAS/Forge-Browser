@@ -2,80 +2,89 @@ mod engine;
 mod ui;
 
 use eframe::egui;
-use std::sync::mpsc::{self, Receiver, Sender};
+// Trocamos mpsc por crossbeam_channel para garantir Thread Safety (Send)
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::thread;
-use crate::engine::{ElementoWeb, baixar_html_bruto, processar_html_semantico, resolve_smart_query};
-use crate::ui::theme;
+use crate::engine::{ParsedPage, fetch_page, resolve_smart_query};
+use crate::ui::{theme, renderer};
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
+            .with_inner_size([1280.0, 860.0])
             .with_title("Forge Browser"),
         ..Default::default()
     };
-    
+
     eframe::run_native(
         "Forge Browser",
         options,
         Box::new(|cc| {
             theme::apply_style(&cc.egui_ctx);
-            Box::new(ForgeApp::new())
+            // Retorno Ok(Box::new(...)) exigido pela versão 0.24+
+            Ok(Box::new(ForgeApp::new()))
         }),
     )
 }
 
+// ── Estado da aplicação ───────────────────────────────────────────────────────
+
 struct ForgeApp {
-    query: String,
     url_input: String,
-    content: Vec<ElementoWeb>,
+    query_home: String,
+    page: Option<ParsedPage>,
     history: Vec<String>,
     history_index: usize,
-    tx: Sender<Vec<ElementoWeb>>,
-    rx: Receiver<Vec<ElementoWeb>>,
+    tx: Sender<ParsedPage>,
+    rx: Receiver<ParsedPage>, // crossbeam::Receiver implementa Send
     loading: bool,
     show_home: bool,
+    status_msg: String,
 }
 
 impl ForgeApp {
     fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
+        // Criando canal crossbeam
+        let (tx, rx) = unbounded();
         Self {
-            query: "".to_owned(),
-            url_input: "".to_owned(),
-            content: vec![],
-            history: vec![],
+            url_input: String::new(),
+            query_home: String::new(),
+            page: None,
+            history: Vec::new(),
             history_index: 0,
             tx,
             rx,
             loading: false,
             show_home: true,
+            status_msg: String::new(),
         }
     }
 
-    fn navegar(&mut self, query: String, ctx: &egui::Context, save_history: bool) {
-        let target_url = resolve_smart_query(&query);
-        self.url_input = target_url.clone();
+    fn navigate(&mut self, input: String, ctx: &egui::Context, save_history: bool) {
+        let url = resolve_smart_query(&input);
+        if url.is_empty() { return; }
+
+        self.url_input = url.clone();
         self.loading = true;
         self.show_home = false;
-        
+        self.status_msg = format!("Carregando {}", url);
+
         if save_history {
             if self.history_index < self.history.len() {
                 self.history.truncate(self.history_index + 1);
             }
-            self.history.push(target_url.clone());
-            self.history_index = self.history.len() - 1;
+            self.history.push(url.clone());
+            self.history_index = self.history.len().saturating_sub(1);
         }
 
         let tx = self.tx.clone();
-        let ctx_clone = ctx.clone();
-        let url_to_fetch = target_url.clone();
+        let ctx_c = ctx.clone();
+        let url_c = url;
 
         thread::spawn(move || {
-            let html = baixar_html_bruto(&url_to_fetch);
-            let elementos = processar_html_semantico(&html, &url_to_fetch);
-            let _ = tx.send(elementos);
-            ctx_clone.request_repaint();
+            let page = fetch_page(&url_c);
+            let _ = tx.send(page);
+            ctx_c.request_repaint();
         });
     }
 
@@ -83,7 +92,7 @@ impl ForgeApp {
         if self.history_index > 0 {
             self.history_index -= 1;
             let url = self.history[self.history_index].clone();
-            self.navegar(url, ctx, false);
+            self.navigate(url, ctx, false);
         }
     }
 
@@ -91,146 +100,233 @@ impl ForgeApp {
         if self.history_index + 1 < self.history.len() {
             self.history_index += 1;
             let url = self.history[self.history_index].clone();
-            self.navegar(url, ctx, false);
+            self.navigate(url, ctx, false);
         }
     }
 
     fn reload(&mut self, ctx: &egui::Context) {
         if !self.url_input.is_empty() {
-            self.navegar(self.url_input.clone(), ctx, false);
+            let url = self.url_input.clone();
+            self.navigate(url, ctx, false);
         }
     }
 
     fn go_home(&mut self) {
         self.show_home = true;
-        self.url_input = "".to_string();
-        self.query = "".to_string();
-        self.content = vec![];
+        self.url_input.clear();
+        self.query_home.clear();
+        self.page = None;
+        self.status_msg.clear();
     }
 }
 
+// ── Loop principal egui ───────────────────────────────────────────────────────
+
 impl eframe::App for ForgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Ok(novos_elementos) = self.rx.try_recv() {
-            self.content = novos_elementos;
+        // Recebe página carregada (try_recv do crossbeam)
+        if let Ok(page) = self.rx.try_recv() {
+            self.status_msg = format!("{} — {}", page.title, page.url);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                format!("{} — Forge", page.title)
+            ));
+            self.page = Some(page);
             self.loading = false;
         }
 
-        egui::TopBottomPanel::top("top_bar")
-            .frame(egui::Frame::none().fill(theme::PANEL_DARK).inner_margin(egui::Margin::symmetric(20.0, 10.0)))
+        // ── Barra de navegação superior ──────────────────────────────────────
+        egui::TopBottomPanel::top("nav_bar")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::PANEL_DARK)
+                    .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // Botões de Navegação
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    if ui.button(egui::RichText::new("⬅").size(18.0)).clicked() {
-                        self.go_back(ctx);
-                    }
-                    if ui.button(egui::RichText::new("➡").size(18.0)).clicked() {
-                        self.go_forward(ctx);
-                    }
+                    ui.spacing_mut().item_spacing.x = 8.0;
+
+                    let can_back = self.history_index > 0;
+                    let can_fwd = self.history_index + 1 < self.history.len();
+
+                    if ui.add_enabled(can_back, egui::Button::new(
+                        egui::RichText::new("◀").size(16.0)
+                    )).clicked() { self.go_back(ctx); }
+
+                    if ui.add_enabled(can_fwd, egui::Button::new(
+                        egui::RichText::new("▶").size(16.0)
+                    )).clicked() { self.go_forward(ctx); }
+
                     if ui.button(egui::RichText::new("⟳").size(18.0)).clicked() {
                         self.reload(ctx);
                     }
-                    if ui.button(egui::RichText::new("🏠").size(18.0)).clicked() {
+                    if ui.button(egui::RichText::new("🏠").size(16.0)).clicked() {
                         self.go_home();
                     }
 
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
 
-                    // Barra de Endereço
-                    let rect = ui.available_rect_before_wrap();
-                    let (rect, response) = ui.allocate_at_least(egui::vec2(ui.available_width() - 80.0, 32.0), egui::Sense::click());
-                    
-                    let visual_bg = if response.has_focus() || ui.memory(|m| m.has_focus(egui::Id::new("search_bar"))) {
-                        egui::Color32::from_rgb(60, 60, 60)
-                    } else {
-                        egui::Color32::from_rgb(45, 45, 45)
-                    };
-                    ui.painter().rect_filled(rect, 16.0, visual_bg);
-
-                    let text_edit_response = ui.put(
-                        rect.shrink2(egui::vec2(15.0, 4.0)),
-                        egui::TextEdit::singleline(&mut self.url_input)
-                            .id(egui::Id::new("search_bar"))
-                            .hint_text("Search or type URL...")
-                            .frame(false)
+                    let bar_width = ui.available_width() - if self.loading { 32.0 } else { 0.0 };
+                    let (rect, _) = ui.allocate_at_least(
+                        egui::vec2(bar_width, 32.0),
+                        egui::Sense::hover(),
                     );
-                    
-                    if response.clicked() {
-                        text_edit_response.request_focus();
+                    ui.painter().rect_filled(rect, 16.0, egui::Color32::from_rgb(38, 38, 48));
+
+                    let te = ui.put(
+                        rect.shrink2(egui::vec2(14.0, 4.0)),
+                        egui::TextEdit::singleline(&mut self.url_input)
+                            .id(egui::Id::new("addr_bar"))
+                            .hint_text("Digite uma URL ou pesquise...")
+                            .frame(false),
+                    );
+
+                    if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let q = self.url_input.clone();
+                        self.navigate(q, ctx, true);
                     }
-                    
-                    if (text_edit_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                        self.navegar(self.url_input.clone(), ctx, true);
-                    }
-                    
+
                     if self.loading {
-                        ui.add_space(10.0);
+                        ui.add_space(4.0);
                         ui.spinner();
                     }
                 });
             });
 
+        // ── Barra de status inferior ──────────────────────────────────────────
+        if !self.status_msg.is_empty() {
+            egui::TopBottomPanel::bottom("status_bar")
+                .frame(
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(16, 16, 22))
+                        .inner_margin(egui::Margin::symmetric(16.0, 3.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(&self.status_msg)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(130, 130, 150)),
+                    );
+                });
+        }
+
+        // ── Conteúdo central ─────────────────────────────────────────────────
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme::BACKGROUND_DARK))
             .show(ctx, |ui| {
                 if self.show_home {
-                    // Tela Inicial Centralizada
+                    // Renderização da home page
                     ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.25);
-                        ui.label(egui::RichText::new("FORGE").size(80.0).color(theme::ACCENT_PURPLE).strong());
-                        ui.label(egui::RichText::new("Navegação pura. Foco total.").size(20.0).color(theme::TEXT_GRAY));
-                        ui.add_space(40.0);
+                        ui.add_space(ui.available_height() * 0.22);
 
-                        let (rect, _) = ui.allocate_at_least(egui::vec2(500.0, 45.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 22.5, egui::Color32::from_rgb(45, 45, 45));
-                        
-                        ui.allocate_ui_at_rect(rect.shrink2(egui::vec2(20.0, 5.0)), |ui| {
-                            let res = ui.add(egui::TextEdit::singleline(&mut self.query)
-                                .hint_text("O que você quer descobrir hoje?")
+                        ui.label(
+                            egui::RichText::new("FORGE")
+                                .size(72.0)
+                                .color(theme::ACCENT_PURPLE)
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new("Motor. Motor. Motor.")
+                                .size(18.0)
+                                .color(theme::TEXT_GRAY)
+                                .italics(),
+                        );
+                        ui.add_space(36.0);
+
+                        let (rect, _) = ui.allocate_at_least(
+                            egui::vec2(540.0, 44.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(rect, 22.0, egui::Color32::from_rgb(38, 38, 52));
+
+                        let res = ui.put(
+                            rect.shrink2(egui::vec2(18.0, 6.0)),
+                            egui::TextEdit::singleline(&mut self.query_home)
+                                .hint_text("O que você quer descobrir?")
                                 .frame(false)
-                                .font(egui::FontId::proportional(20.0)));
-                            
-                            if res.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                self.navegar(self.query.clone(), ctx, true);
-                            }
-                        });
-                        
-                        ui.add_space(20.0);
-                        if ui.add(egui::Button::new(egui::RichText::new("Explorar").size(18.0)).rounding(20.0).fill(theme::ACCENT_PURPLE)).clicked() {
-                             self.navegar(self.query.clone(), ctx, true);
+                                .font(egui::FontId::proportional(18.0)),
+                        );
+
+                        if res.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            let q = self.query_home.clone();
+                            self.navigate(q, ctx, true);
+                        }
+
+                        ui.add_space(18.0);
+                        if ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("  Explorar  ").size(16.0),
+                            )
+                            .rounding(20.0)
+                            .fill(theme::ACCENT_PURPLE),
+                        ).clicked() {
+                            let q = self.query_home.clone();
+                            self.navigate(q, ctx, true);
                         }
                     });
                 } else {
-                    // Renderização do Conteúdo
-                    let rect = ui.available_rect_before_wrap();
-                    ui.painter().rect_filled(rect.shrink(10.0), 10.0, egui::Color32::from_rgb(25, 25, 25));
-                    
-                    ui.allocate_ui_at_rect(rect.shrink(30.0), |ui| {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false; 2])
-                            .show(ui, |ui| {
-                                for elemento in self.content.clone() {
-                                    match elemento {
-                                        ElementoWeb::Titulo(t) => {
-                                            ui.label(egui::RichText::new(t).size(28.0).strong().color(theme::ACCENT_PURPLE));
-                                            ui.add_space(15.0);
-                                        }
-                                        ElementoWeb::Texto(txt) => {
-                                            ui.label(egui::RichText::new(txt).size(16.0).color(theme::TEXT_GRAY));
-                                            ui.add_space(10.0);
-                                        }
-                                        ElementoWeb::Link(texto, url) => {
-                                            if ui.link(egui::RichText::new(format!("🔗 {}", texto)).size(16.0).color(egui::Color32::from_rgb(100, 150, 255))).clicked() {
-                                                self.navegar(url, ctx, true);
-                                            }
-                                            ui.add_space(8.0);
+                    // ── Área de renderização da página ────────────────────────
+                    let available = ui.available_rect_before_wrap();
+                    ui.painter().rect_filled(available, 0.0, egui::Color32::from_rgb(18, 18, 24));
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            let inner_rect = egui::Rect::from_min_size(
+                                available.min,
+                                egui::vec2(available.width().min(960.0), available.height()),
+                            );
+
+                            ui.set_max_width(inner_rect.width());
+
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(24.0);
+                                ui.vertical(|ui| {
+                                    ui.set_max_width(inner_rect.width() - 48.0);
+
+                                    if self.loading {
+                                        loading_placeholder(ui);
+                                    } else if let Some(page) = &self.page {
+                                        let nav_url = renderer::render(ui, &page.dom);
+                                        if let Some(url) = nav_url {
+                                            ctx.memory_mut(|m| {
+                                                m.data.insert_temp(egui::Id::new("pending_nav"), url);
+                                            });
                                         }
                                     }
-                                }
+                                });
                             });
+                            ui.add_space(40.0);
+                        });
+
+                    // Processa navegação pendente
+                    let pending = ctx.memory_mut(|m| {
+                        m.data.get_temp::<String>(egui::Id::new("pending_nav"))
                     });
+                    if let Some(url) = pending {
+                        ctx.memory_mut(|m| {
+                            m.data.remove::<String>(egui::Id::new("pending_nav"))
+                        });
+                        if !url.is_empty() && !url.starts_with('#') && !url.starts_with("javascript:") {
+                            self.navigate(url, ctx, true);
+                        }
+                    }
                 }
             });
     }
+}
+
+// ── Helpers de UI ─────────────────────────────────────────────────────────────
+
+fn loading_placeholder(ui: &mut egui::Ui) {
+    ui.add_space(60.0);
+    ui.vertical_centered(|ui| {
+        ui.spinner();
+        ui.add_space(16.0);
+        ui.label(
+            egui::RichText::new("Carregando página...")
+                .size(16.0)
+                .color(theme::TEXT_GRAY),
+        );
+    });
 }
